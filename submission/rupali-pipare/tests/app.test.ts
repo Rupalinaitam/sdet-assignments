@@ -1,5 +1,15 @@
+import crypto from 'crypto';
 import request from 'supertest';
 import app from '../src/app';
+
+const webhookSecret = process.env.WEBHOOK_SECRET || 'test-webhook-secret';
+
+function createSignature(payload: string): string {
+    return crypto
+        .createHmac('sha256', webhookSecret)
+        .update(Buffer.from(payload))
+        .digest('hex');
+}
 
 describe('Health API', () => {
     it('should return service health status', async () => {
@@ -13,6 +23,7 @@ describe('Health API', () => {
             message: 'Subscription & Billing Service is running',
         });
     });
+
     it('should return 404 when subscription is not found', async () => {
         const response = await request(app)
             .get('/subscriptions/unknown-subscription-id');
@@ -23,6 +34,7 @@ describe('Health API', () => {
             error: 'Subscription not found',
         });
     });
+
     it('should create a subscription successfully', async () => {
         const response = await request(app)
             .post('/subscriptions')
@@ -46,6 +58,7 @@ describe('Health API', () => {
         expect(response.body.createdAt).toBeDefined();
         expect(response.body.updatedAt).toBeDefined();
     });
+
     it('should return 400 when required fields are missing', async () => {
         const response = await request(app)
             .post('/subscriptions')
@@ -110,5 +123,133 @@ describe('Health API', () => {
         expect(secondCancelResponse.body.error).toContain(
             'Invalid subscription transition',
         );
+    });
+});
+
+describe('Payment Webhook API', () => {
+    async function createSubscription(): Promise<string> {
+        const response = await request(app)
+            .post('/subscriptions')
+            .send({
+                customerId: `webhook-customer-${Date.now()}`,
+                planId: 'basic-monthly',
+                amount: 999,
+            });
+
+        expect(response.status).toBe(201);
+
+        return response.body.id;
+    }
+
+    it('should accept a webhook with a valid signature', async () => {
+        const subscriptionId = await createSubscription();
+
+        const payload = JSON.stringify({
+            eventId: `event-valid-${Date.now()}`,
+            eventType: 'payment_succeeded',
+            subscriptionId,
+            paymentId: 'payment-001',
+        });
+
+        const response = await request(app)
+            .post('/webhooks/payment-provider')
+            .set('Content-Type', 'application/json')
+            .set('x-webhook-signature', createSignature(payload))
+            .send(payload);
+
+        expect(response.status).toBe(200);
+        expect(response.body.id).toBe(subscriptionId);
+        expect(response.body.status).toBe('active');
+    });
+
+    it('should reject a webhook with an invalid signature', async () => {
+        const subscriptionId = await createSubscription();
+
+        const payload = JSON.stringify({
+            eventId: `event-invalid-${Date.now()}`,
+            eventType: 'payment_succeeded',
+            subscriptionId,
+        });
+
+        const response = await request(app)
+            .post('/webhooks/payment-provider')
+            .set('Content-Type', 'application/json')
+            .set('x-webhook-signature', 'invalid-signature')
+            .send(payload);
+
+        expect(response.status).toBe(401);
+
+        expect(response.body).toEqual({
+            error: 'Invalid webhook signature',
+        });
+    });
+
+    it('should reject a webhook when the signature is missing', async () => {
+        const subscriptionId = await createSubscription();
+
+        const payload = JSON.stringify({
+            eventId: `event-missing-${Date.now()}`,
+            eventType: 'payment_succeeded',
+            subscriptionId,
+        });
+
+        const response = await request(app)
+            .post('/webhooks/payment-provider')
+            .set('Content-Type', 'application/json')
+            .send(payload);
+
+        expect(response.status).toBe(401);
+
+        expect(response.body).toEqual({
+            error: 'Invalid webhook signature',
+        });
+    });
+
+    it('should reject malformed JSON payloads', async () => {
+        const payload = '{"eventId":';
+
+        const response = await request(app)
+            .post('/webhooks/payment-provider')
+            .set('Content-Type', 'application/json')
+            .set('x-webhook-signature', createSignature(payload))
+            .send(payload);
+
+        expect(response.status).toBe(400);
+
+        expect(response.body).toEqual({
+            error: 'Malformed JSON payload',
+        });
+    });
+
+    it('should process duplicate webhook events only once', async () => {
+        const subscriptionId = await createSubscription();
+
+        const payload = JSON.stringify({
+            eventId: `event-duplicate-${Date.now()}`,
+            eventType: 'payment_succeeded',
+            subscriptionId,
+            paymentId: 'payment-duplicate',
+        });
+
+        const signature = createSignature(payload);
+
+        const firstResponse = await request(app)
+            .post('/webhooks/payment-provider')
+            .set('Content-Type', 'application/json')
+            .set('x-webhook-signature', signature)
+            .send(payload);
+
+        const secondResponse = await request(app)
+            .post('/webhooks/payment-provider')
+            .set('Content-Type', 'application/json')
+            .set('x-webhook-signature', signature)
+            .send(payload);
+
+        expect(firstResponse.status).toBe(200);
+        expect(secondResponse.status).toBe(200);
+
+        expect(firstResponse.body.id).toBe(subscriptionId);
+        expect(secondResponse.body.id).toBe(subscriptionId);
+        expect(secondResponse.body.status).toBe('active');
     });
 });
